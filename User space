@@ -1,0 +1,101 @@
+#define _GNU_SOURCE
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/mman.h>
+#include <sched.h>
+#include <unistd.h>
+#include <string.h>
+#include <fcntl.h>
+#include <bpf/libbpf.h>
+
+#define STACK_SIZE (8 * 1024 * 1024) // Explicit 8MB Core Stack
+
+// Callback handler invoked instantly on packet commitment to memory ring
+static int handle_packet(void *ctx, void *data, size_t data_sz) {
+    // Process payload under zero-latency constraints
+    asm volatile("" ::: "memory"); 
+    return 0;
+}
+
+void warm_thread_stack(void) {
+    volatile char buffer[STACK_SIZE];
+    // Force immediate physical page mapping across the runtime stack
+    for (size_t i = 0; i < STACK_SIZE; i += 4096) {
+        buffer[i] = 0;
+    }
+}
+
+void* rt_worker_loop(void* arg) {
+    warm_thread_stack();
+
+    // Rigid lock to Dedicated Isolated Core 2
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(2, &cpuset); 
+    
+    pthread_t thread = pthread_self();
+    if (pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset) != 0) {
+        perror("[-] Failed to bind affinity to Core 2");
+        exit(1);
+    }
+
+    // Elevate to Real-Time priority 98 (leaving priority 99 for kernel safety watchdogs)
+    struct sched_param param;
+    param.sched_priority = 98; 
+    if (pthread_setschedparam(thread, SCHED_FIFO, &param) != 0) {
+        perror("[-] Critical Failure elevating to SCHED_FIFO");
+        exit(1);
+    }
+
+    printf("[+] Real-time worker thread initialized on Core 2 under SCHED_FIFO.\n");
+
+    // Open reference mapping directly to pinned kernel bypass map
+    int map_fd = bpf_obj_get("/sys/fs/bpf/rx_ringbuf");
+    if (map_fd < 0) {
+        perror("[-] Failed to retrieve pinned eBPF ring buffer map");
+        exit(1);
+    }
+
+    struct ring_buffer *rb = ring_buffer__new(map_fd, handle_packet, NULL, NULL);
+    if (!rb) {
+        fprintf(stderr, "[-] Failed to instantiate user-space ring buffer manager\n");
+        exit(1);
+    }
+
+    // Infinite non-blocking loop eliminating context swaps
+    while (1) {
+        ring_buffer__poll(rb, 0); // Timeout 0 ensures absolute continuous polling
+        asm volatile("" ::: "memory");
+    }
+
+    ring_buffer__free(rb);
+    close(map_fd);
+    return NULL;
+}
+
+int main() {
+    // Weld the process memory mapping directly to physical silicon
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+        perror("[-] Fatal: mlockall failed");
+        exit(1);
+    }
+
+    pthread_t worker_thread;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    
+    if (pthread_attr_setstacksize(&attr, STACK_SIZE) != 0) {
+        perror("[-] Failed to configure explicit stack size bounds");
+        exit(1);
+    }
+
+    if (pthread_create(&worker_thread, &attr, rt_worker_loop, NULL) != 0) {
+        perror("[-] Real-time worker execution thread instantiation failed");
+        exit(1);
+    }
+
+    pthread_attr_destroy(&attr);
+    pthread_join(worker_thread, NULL);
+    return 0;
+}
